@@ -7,11 +7,17 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  */
 
-/*global Session:false, logger:false*/
+/*global Session:false, chrome:true */
 /* jshint evil:true */
 
 (function() {
   'use strict';
+
+  /**
+   * Constants
+   */
+
+  var FLO_CONFIG_KEY = 'flo-config';
 
   /**
    * Flo client controller.
@@ -21,27 +27,30 @@
    */
 
   function FloClient() {
-    this.config = loadConfig();
-    this.session = null;
-    this.panelWindow = null;
-    this.panelEventBuffer = [];
-    this.status = this.status.bind(this);
-    this.startNewSession = this.startNewSession.bind(this);
-    this.logger = Logger(this.triggerEvent.bind(this, 'log'));
-    this.log = this.logger('flo');
-    this.createPanel();
-    this.start();
+    var self = this;
+    loadConfig(function (config) {
+      self.config = config;
+      self.session = null;
+      self.panelWindow = null;
+      self.panelEventBuffer = [];
+      self.status = self.status.bind(self);
+      self.startNewSession = self.startNewSession.bind(self);
+      self.createLogger = Logger(self.triggerEvent.bind(self, 'log'));
+      self.logger = self.createLogger('flo');
+      self.createPanel();
+      self.start();
+    });
   }
 
   /**
-   * Save and optionally set new config.
+   * Save current config to disk.
    *
    * @param {object} config
    * @private
    */
 
   FloClient.prototype.saveConfig = function() {
-    localStorage.setItem('flo-config', JSON.stringify(this.config));
+    saveConfig(this.config);
   };
 
   /**
@@ -72,10 +81,10 @@
   FloClient.prototype.triggerEvent = function(type, data) {
     var event = new Event('flo_' + type);
     event.data = data;
+    // Save events for anytime we need to reinit the panel with prev state.
+    this.panelEventBuffer.push(event);
     if (this.panelWindow) {
       this.panelWindow.dispatchEvent(event);
-    } else {
-      this.panelEventBuffer.push(event);
     }
     return event;
   };
@@ -95,8 +104,11 @@
       'configure/configure.html',
       function (panel) {
         panel.onShown.addListener(function(panelWindow) {
-          self.panelWindow = panelWindow;
-          self.bindPanelEvents();
+          if (!panelWindow.wasShown) {
+            self.panelWindow = panelWindow;
+            self.initPanel();
+            panelWindow.wasShown = true;
+          }
         });
       }
     );
@@ -110,7 +122,7 @@
    * @private
    */
 
-  FloClient.prototype.bindPanelEvents = function() {
+  FloClient.prototype.initPanel = function() {
     this.listenToPanel('config_changed', function(e) {
       this.config = e.data;
       this.saveConfig();
@@ -121,7 +133,6 @@
     this.panelEventBuffer.forEach(function(event) {
       this.panelWindow.dispatchEvent(event);
     }, this);
-    this.panelEventBuffer = [];
     this.triggerEvent('load', this.config);
   };
 
@@ -157,7 +168,7 @@
 
   FloClient.prototype.getLocation = function(callback) {
     chrome.devtools.inspectedWindow['eval'](
-      'location.hostname',
+      'location.hostname || location.href',
       callback.bind(this)
     );
   };
@@ -205,7 +216,7 @@
             site.server || host,
             site.port || this.config.port,
             this.status,
-            this.logger
+            this.createLogger
           );
           this.session.start();
         } else {
@@ -281,21 +292,95 @@
   };
 
   /**
-   * Loads config from localstorage.
+   * Save passed in config object to disk.
    *
+   * @param {object} config
    * @private
    */
 
-  function loadConfig() {
-    var config = localStorage.getItem('flo-config');
-    try {
-      config = JSON.parse(config);
-    } catch (e) {} finally {
-      return config || {
-        sites: [],
-        port: 8888
-      };
+  function saveConfig(config) {
+    chrome.runtime.sendMessage({
+      name: 'localStorage:set',
+      key: FLO_CONFIG_KEY,
+      data: JSON.stringify(config)
+    });
+  }
+
+  /**
+   * Loads config from storage.
+   *
+   * @param {function} done
+   * @private
+   */
+
+  function loadConfig(done) {
+    var configJSON = tryToLoadLegacyConfig();
+
+    if (configJSON) {
+      var config = parseConfig(configJSON);
+      // Persist new config to the new storage.
+      saveConfig(config);
+      setTimeout(done.bind(null, config), 0);
     }
+    else {
+      chrome.runtime.sendMessage(
+        {
+          name : 'localStorage:get',
+          key : FLO_CONFIG_KEY
+        },
+        function (configJSON){
+          var config = parseConfig(configJSON);
+          done(config);
+        }
+      );
+    }
+  }
+
+  /**
+   * Parses config and sets sensible defaults.
+   *
+   * @param {string} config
+   * @param {}
+   * @private
+   */
+
+  function parseConfig(configJSON) {
+    var config;
+
+    try {
+      config = JSON.parse(configJSON);
+    }
+    catch (ex) {
+      config = {};
+    }
+
+    config.sites = config.sites || [];
+    config.port = config.port || 8888;
+
+    return config;
+  }
+
+  /**
+   * Tries to load config from localstorage which was the old way of storing
+   * config and returns false if it fails.
+   *
+   * @return {string} config
+   * @private
+   */
+
+  function tryToLoadLegacyConfig() {
+    var config = null;
+
+    try {
+      config = window.localStorage && localStorage.getItem(FLO_CONFIG_KEY);
+      if (config) {
+        localStorage.removeItem(FLO_CONFIG_KEY);
+      }
+    } catch (e) {
+      return false;
+    }
+
+    return config;
   }
 
   /**
